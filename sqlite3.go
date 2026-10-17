@@ -533,6 +533,19 @@ const (
 type SQLiteDriver struct {
 	Extensions  []string
 	ConnectHook func(*SQLiteConn) error
+	// PreConnectHook runs immediately after sqlite3_open_v2 succeeds and BEFORE
+	// any internal PRAGMA (busy_timeout, locking_mode, journal_mode, ...). It is
+	// the only safe place to install an encryption codec key: anything later has
+	// already triggered a page-1 read that fails on an encrypted file.
+	//
+	// The *SQLiteConn passed in has only its underlying sqlite3* handle set;
+	// URI-derived state (loc, txlock, statement cache, function/aggregator
+	// registries) has NOT been initialized yet. Use it for codec/key setup
+	// only — PRAGMA key, PRAGMA cipher, sqlite3mc_config(), and similar
+	// statement-less operations are safe via Exec. Avoid Query/Prepare of
+	// typed columns and avoid registering Go functions or aggregators here:
+	// loc is nil (timestamps fall back to UTC) and statement caching is off.
+	PreConnectHook func(*SQLiteConn) error
 }
 
 // SQLiteConn implements driver.Conn.
@@ -1094,6 +1107,18 @@ func (c *SQLiteConn) AutoCommit() bool {
 		return false
 	}
 	return int(C.sqlite3_get_autocommit(c.db)) != 0
+}
+
+// Interrupt makes the statement running on c, if any, fail with
+// SQLITE_INTERRUPT; see sqlite3_interrupt. Unlike a context, it costs nothing
+// until it is called. It may be called from any goroutine, while c runs a
+// statement, and after c is closed, when it does nothing.
+func (c *SQLiteConn) Interrupt() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db != nil {
+		C.sqlite3_interrupt(c.db)
+	}
 }
 
 func (c *SQLiteConn) lastError() error {
@@ -1800,6 +1825,17 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 		conn.stmtCacheEnabled = false
 	}
 
+	// PreConnectHook runs BEFORE any internal PRAGMA so an encryption codec
+	// key (e.g. PRAGMA key/hexkey) can be installed before SQLite touches
+	// page 1 of the database file.
+	if d.PreConnectHook != nil {
+		preConn := &SQLiteConn{db: db}
+		if err := d.PreConnectHook(preConn); err != nil {
+			_ = preConn.Close()
+			return nil, err
+		}
+	}
+
 	exec := func(s string) error {
 		cs := C.CString(s)
 		rv := C.sqlite3_exec(db, cs, nil, nil, nil)
@@ -2242,6 +2278,19 @@ func (c *SQLiteConn) prepareWithCache(ctx context.Context, query string) (driver
 		ss.cacheKey = query
 	}
 	return ss, nil
+}
+
+// PrepareCached is Prepare through the connection's statement cache
+// (_stmt_cache_size), as Exec and Query use it: it takes a statement for
+// query from the cache, or prepares one, and Close returns the statement to
+// the cache instead of finalizing it. Only a query holding a single
+// statement is cached. Without the cache it is Prepare.
+func (c *SQLiteConn) PrepareCached(ctx context.Context, query string) (*SQLiteStmt, error) {
+	stmt, err := c.prepareWithCache(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return stmt.(*SQLiteStmt), nil
 }
 
 // Run-Time Limit Categories.
