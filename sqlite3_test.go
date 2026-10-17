@@ -4,7 +4,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build cgo
-// +build cgo
 
 package sqlite3
 
@@ -468,7 +467,7 @@ func TestUpdate(t *testing.T) {
 		t.Fatal("Failed to get LastInsertId:", err)
 	}
 	if expected != lastID {
-		t.Errorf("Expected %q for last Id, but %q:", expected, lastID)
+		t.Errorf("Expected %d for last Id, but %d:", expected, lastID)
 	}
 	affected, _ = res.RowsAffected()
 	if err != nil {
@@ -521,7 +520,7 @@ func TestDelete(t *testing.T) {
 		t.Fatal("Failed to get RowsAffected:", err)
 	}
 	if affected != 1 {
-		t.Errorf("Expected %d for cout of affected rows, but %q:", 1, affected)
+		t.Errorf("Expected %d for cout of affected rows, but %d:", 1, affected)
 	}
 
 	res, err = db.Exec("delete from foo where id = 123")
@@ -533,14 +532,14 @@ func TestDelete(t *testing.T) {
 		t.Fatal("Failed to get LastInsertId:", err)
 	}
 	if expected != lastID {
-		t.Errorf("Expected %q for last Id, but %q:", expected, lastID)
+		t.Errorf("Expected %d for last Id, but %d:", expected, lastID)
 	}
 	affected, err = res.RowsAffected()
 	if err != nil {
 		t.Fatal("Failed to get RowsAffected:", err)
 	}
 	if affected != 1 {
-		t.Errorf("Expected %d for cout of affected rows, but %q:", 1, affected)
+		t.Errorf("Expected %d for cout of affected rows, but %d:", 1, affected)
 	}
 
 	rows, err := db.Query("select id from foo")
@@ -2017,6 +2016,124 @@ func TestAuthorizer(t *testing.T) {
 	}
 }
 
+func TestAuthorizerHandleRelease(t *testing.T) {
+	openConn := func() *SQLiteConn {
+		t.Helper()
+		conn, err := (&SQLiteDriver{}).Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := conn.(*SQLiteConn)
+		t.Cleanup(func() {
+			if err := c.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return c
+	}
+	countHandles := func(c *SQLiteConn) int {
+		got := 0
+		handleVals.Range(func(_, value any) bool {
+			if value.(handleVal).db == c {
+				got++
+			}
+			return true
+		})
+		return got
+	}
+	checkHandles := func(c *SQLiteConn, want int) {
+		t.Helper()
+		got := countHandles(c)
+		if got != want {
+			t.Fatalf("connection has %d callback handles, want %d", got, want)
+		}
+	}
+
+	c, other := openConn(), openConn()
+	updates := 0
+	c.RegisterUpdateHook(func(int, string, string, int64) { updates++ })
+	if err := c.RegisterFunc("retained", func() int { return 42 }, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec("CREATE TABLE foo (value INTEGER)", nil); err != nil {
+		t.Fatal(err)
+	}
+	baseline := countHandles(c)
+	otherBaseline := countHandles(other)
+	otherCalls := 0
+	other.RegisterAuthorizer(func(int, string, string, string) int {
+		otherCalls++
+		return SQLITE_OK
+	})
+	checkHandles(other, otherBaseline+1)
+	c.RegisterAuthorizer(nil)
+	checkHandles(c, baseline)
+
+	calls := make([]int, 3)
+	for i := range calls {
+		i := i
+		previous := append([]int(nil), calls...)
+		c.RegisterAuthorizer(func(int, string, string, string) int {
+			calls[i]++
+			return SQLITE_OK
+		})
+		checkHandles(c, baseline+1)
+		if _, err := c.Exec("INSERT INTO foo VALUES (retained())", nil); err != nil {
+			t.Fatal(err)
+		}
+		if calls[i] == 0 {
+			t.Fatalf("authorizer %d was not called", i)
+		}
+		if !reflect.DeepEqual(calls[:i], previous[:i]) {
+			t.Fatal("a replaced authorizer was called")
+		}
+	}
+
+	previous := append([]int(nil), calls...)
+	c.RegisterAuthorizer(nil)
+	c.RegisterAuthorizer(nil)
+	checkHandles(c, baseline)
+	if _, err := c.Exec("INSERT INTO foo VALUES (retained())", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, previous) {
+		t.Fatal("a removed authorizer was called")
+	}
+	if updates != len(calls)+1 {
+		t.Fatalf("update hook called %d times, want %d", updates, len(calls)+1)
+	}
+	rows, err := c.Query("SELECT sum(value) FROM foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if values[0] != int64(42*(len(calls)+1)) {
+		t.Fatalf("sum(value) = %v, want %d", values[0], 42*(len(calls)+1))
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkHandles(c, 0)
+	checkHandles(other, otherBaseline+1)
+	if _, err := other.Exec("SELECT 1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if otherCalls == 0 {
+		t.Fatal("the other connection's authorizer was not called")
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkHandles(other, 0)
+}
+
 func TestSetFileControlInt(t *testing.T) {
 	t.Run("PERSIST_WAL", func(t *testing.T) {
 		tempFilename := TempFilename(t)
@@ -2253,6 +2370,36 @@ func TestNamedParamClearBindings(t *testing.T) {
 	if z.Valid {
 		t.Errorf("Expected z to be NULL, got %d", z.Int64)
 	}
+}
+
+func TestNotEnoughArgsErrorMessage(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const want = "not enough args to execute query: want 1 got 0"
+
+	t.Run("exec", func(t *testing.T) {
+		_, err := db.Exec("SELECT ?; SELECT ?", "hello")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != want {
+			t.Errorf("got %q, want %q", err.Error(), want)
+		}
+	})
+
+	t.Run("query", func(t *testing.T) {
+		_, err := db.Query("SELECT ?; SELECT ?", "hello")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != want {
+			t.Errorf("got %q, want %q", err.Error(), want)
+		}
+	})
 }
 
 // https://github.com/mattn/go-sqlite3/issues/1390
@@ -2875,6 +3022,91 @@ func benchmarkQueryParallel(b *testing.B) {
 			if err := db.QueryRow("SELECT 1, 2, 3, 4").Scan(&i, &i, &i, &i); err != nil {
 				panic(err)
 			}
+		}
+	})
+}
+
+// TestConnMethodsAfterClose exercises the *SQLiteConn methods that reach
+// into SQLite with the connection handle. SQLite dereferences that handle
+// without checking it, so before these guards every one of them crashed
+// the process when called on a connection captured from a ConnectHook and
+// used after Close.
+func TestConnMethodsAfterClose(t *testing.T) {
+	driverName := fmt.Sprintf("sqlite3_after_close_%d", time.Now().UnixNano())
+	var conn *SQLiteConn
+	sql.Register(driverName, &SQLiteDriver{
+		ConnectHook: func(c *SQLiteConn) error {
+			conn = c
+			return nil
+		},
+	})
+	db, err := sql.Open(driverName, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn == nil {
+		t.Fatal("ConnectHook did not run")
+	}
+
+	t.Run("errors", func(t *testing.T) {
+		cases := []struct {
+			name string
+			call func() error
+		}{
+			{"RegisterCollation", func() error {
+				return conn.RegisterCollation("c", func(string, string) int { return 0 })
+			}},
+			{"RegisterFunc", func() error {
+				return conn.RegisterFunc("f", func() int64 { return 1 }, true)
+			}},
+			{"RegisterAggregator", func() error {
+				return conn.RegisterAggregator("a", func() *sumAggregator {
+					var ret sumAggregator
+					return &ret
+				}, true)
+			}},
+			{"SetFileControlInt", func() error {
+				return conn.SetFileControlInt("", SQLITE_FCNTL_CHUNK_SIZE, 4096)
+			}},
+			{"SetFileControlInt64", func() error {
+				return conn.SetFileControlInt64("", SQLITE_FCNTL_CHUNK_SIZE, 4096)
+			}},
+		}
+		for _, tc := range cases {
+			if err := tc.call(); !errors.Is(err, errConnClosed) {
+				t.Errorf("%s error = %v, want %v", tc.name, err, errConnClosed)
+			}
+		}
+	})
+
+	t.Run("noops", func(t *testing.T) {
+		// These have no error to report, so they must simply do nothing.
+		conn.RegisterCommitHook(func() int { return 0 })
+		conn.RegisterRollbackHook(func() {})
+		conn.RegisterUpdateHook(func(int, string, string, int64) {})
+		conn.RegisterAuthorizer(func(int, string, string, string) int { return SQLITE_OK })
+		conn.RegisterAuthorizer(nil)
+	})
+
+	t.Run("values", func(t *testing.T) {
+		if got := conn.AutoCommit(); got {
+			t.Errorf("AutoCommit() = %v, want false", got)
+		}
+		if got := conn.GetFilename("main"); got != "" {
+			t.Errorf("GetFilename() = %q, want empty", got)
+		}
+		if got := conn.GetLimit(SQLITE_LIMIT_LENGTH); got != -1 {
+			t.Errorf("GetLimit() = %d, want -1", got)
+		}
+		if got := conn.SetLimit(SQLITE_LIMIT_LENGTH, 1000); got != -1 {
+			t.Errorf("SetLimit() = %d, want -1", got)
 		}
 	})
 }
